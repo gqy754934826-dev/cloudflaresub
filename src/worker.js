@@ -160,10 +160,19 @@ function buildSourceConfig(body) {
 }
 
 async function fetchRemoteEndpoints(sourceConfig) {
-  const response = await fetch(sourceConfig.remoteSourceUrl, {
+  const requestUrl = new URL(sourceConfig.remoteSourceUrl);
+  requestUrl.searchParams.set('_ts', String(Date.now()));
+
+  const response = await fetch(requestUrl.toString(), {
     headers: {
-      'user-agent': 'cloudflare-sub-worker/2.0',
-      accept: 'text/html,text/plain;q=0.9,*/*;q=0.8',
+      'user-agent':
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36',
+      accept:
+        'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+      'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8',
+      'cache-control': 'no-cache, no-store, max-age=0',
+      pragma: 'no-cache',
+      referer: requestUrl.origin + '/',
     },
     cf: {
       cacheEverything: false,

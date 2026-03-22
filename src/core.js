@@ -798,6 +798,28 @@ function extractEndpointsFromHtmlContent(inputText, context) {
     }
   }
 
+  if (!candidates.length && !context.carrierFilters.length) {
+    for (const line of lines) {
+      const hosts = [...line.matchAll(HOST_GLOBAL_PATTERN)];
+      if (!hosts.length) {
+        continue;
+      }
+
+      for (const hostMatch of hosts) {
+        const host = sanitizeHost(hostMatch[0]);
+        const portMatch = line
+          .slice(hostMatch.index + hostMatch[0].length)
+          .match(/^\s*:\s*(\d{1,5})/);
+        candidates.push({
+          host,
+          port: portMatch ? normalizePort(portMatch[1], context.defaultPort) : context.defaultPort,
+          carrier: '',
+          label: host,
+        });
+      }
+    }
+  }
+
   return buildPreferredEndpointsFromCandidates(candidates, context, 'HTML');
 }
 

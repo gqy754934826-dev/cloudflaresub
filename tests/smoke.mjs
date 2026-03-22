@@ -86,6 +86,24 @@ assert.equal(remoteHtml.endpoints.length, 2);
 assert.equal(remoteHtml.endpoints[0].label, `${CARRIER_TELECOM}-01`);
 assert.equal(remoteHtml.endpoints[1].label, `${CARRIER_MOBILE}-01`);
 
+const remoteHtmlNoCarrier = extractPreferredEndpointsFromContent(
+  `
+  <table>
+    <tr><td>104.16.40.1</td><td>18 ms</td></tr>
+    <tr><td>104.17.50.2</td><td>22 ms</td></tr>
+  </table>
+  `,
+  {
+    defaultPort: 443,
+    carrierFilters: '',
+    maxEndpoints: 2,
+  },
+);
+assert.equal(remoteHtmlNoCarrier.parser, 'html');
+assert.equal(remoteHtmlNoCarrier.endpoints.length, 2);
+assert.equal(remoteHtmlNoCarrier.endpoints[0].host, '104.16.40.1');
+assert.equal(remoteHtmlNoCarrier.endpoints[1].host, '104.17.50.2');
+
 const raw = renderRawSubscription(expanded.nodes);
 assert.ok(raw.length > 10);
 
