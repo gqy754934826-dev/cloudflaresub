@@ -143,6 +143,70 @@ export function parsePreferredEndpoints(inputText) {
   return { endpoints, warnings };
 }
 
+export function extractPreferredEndpointsFromContent(inputText, options = {}) {
+  const text = normalizeRemoteSourceText(inputText);
+  const defaultPort = normalizePort(options.defaultPort, 443);
+  const maxEndpoints = clampInteger(options.maxEndpoints, 1, 200, 12);
+  const filterList = normalizeCarrierFilters(options.carrierFilters);
+  const allowedCarriers = new Set(filterList);
+  const counters = new Map();
+  const buckets = new Map();
+  const warnings = [];
+  const seen = new Set();
+  const pattern =
+    /(电信|联通|移动|多线|IPV6|IPv6|ipv6)\s+(\[[^\]]+\]|(?:\d{1,3}\.){3}\d{1,3}|(?:[A-Fa-f0-9]{0,4}:){2,}[A-Fa-f0-9]{0,4})/g;
+
+  for (const match of text.matchAll(pattern)) {
+    const carrier = normalizeCarrierName(match[1]);
+    if (allowedCarriers.size && !allowedCarriers.has(carrier)) {
+      continue;
+    }
+
+    const rawHost = String(match[2] || '').trim();
+    const host = rawHost.replace(/^\[|\]$/g, '');
+    const dedupeKey = `${host}:${defaultPort}`;
+    if (!host || seen.has(dedupeKey)) {
+      continue;
+    }
+
+    seen.add(dedupeKey);
+
+    const count = (counters.get(carrier) || 0) + 1;
+    counters.set(carrier, count);
+
+    const endpoint = {
+      host,
+      port: defaultPort,
+      label: `${carrier}-${String(count).padStart(2, '0')}`,
+    };
+    const list = buckets.get(carrier) || [];
+    list.push(endpoint);
+    buckets.set(carrier, list);
+  }
+
+  const carrierOrder = filterList.length ? filterList : [...buckets.keys()];
+  const endpoints = [];
+  let cursor = 0;
+
+  while (endpoints.length < maxEndpoints && carrierOrder.length) {
+    const carrier = carrierOrder[cursor % carrierOrder.length];
+    const list = buckets.get(carrier) || [];
+    if (list.length) {
+      endpoints.push(list.shift());
+    }
+    cursor += 1;
+    if (carrierOrder.every((item) => !(buckets.get(item) || []).length)) {
+      break;
+    }
+  }
+
+  if (!endpoints.length) {
+    warnings.push('Remote preferred IP source did not yield any usable endpoints.');
+  }
+
+  return { endpoints, warnings };
+}
+
 export function expandNodes(baseNodes, endpoints, options = {}) {
   const keepOriginalHost = options.keepOriginalHost !== false;
   const namePrefix = String(options.namePrefix || '').trim();
@@ -158,7 +222,7 @@ export function expandNodes(baseNodes, endpoints, options = {}) {
     endpoints.forEach((endpoint, index) => {
       const port = endpoint.port || baseNode.port;
       const label = endpoint.label || `${endpoint.host}:${port}`;
-      const suffix = namePrefix ? `${namePrefix}-${index + 1}` : label;
+      const suffix = [namePrefix, label].filter(Boolean).join(' | ');
       const clone = deepClone(baseNode);
       clone.server = endpoint.host;
       clone.port = port;
@@ -568,6 +632,63 @@ function splitHostAndPort(input) {
   }
 
   return { host: value, port: undefined };
+}
+
+function normalizeRemoteSourceText(inputText) {
+  return decodeHtmlEntities(
+    String(inputText || '')
+      .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+      .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+      .replace(/<[^>]+>/g, '\n')
+      .replace(/\r\n?/g, '\n')
+      .replace(/\u00a0/g, ' '),
+  );
+}
+
+function normalizeCarrierFilters(input) {
+  const values = Array.isArray(input) ? input : splitCsvLike(input);
+  return values.map((item) => normalizeCarrierName(item)).filter(Boolean);
+}
+
+function normalizeCarrierName(value) {
+  const text = String(value || '').trim().toLowerCase();
+  if (!text) {
+    return '';
+  }
+  if (text === 'ct' || text === 'telecom' || text === '电信') {
+    return '电信';
+  }
+  if (text === 'cu' || text === 'unicom' || text === '联通') {
+    return '联通';
+  }
+  if (text === 'cmcc' || text === 'mobile' || text === '移动') {
+    return '移动';
+  }
+  if (text === 'multi' || text === '多线') {
+    return '多线';
+  }
+  if (text === 'ipv6' || text === 'ip6') {
+    return 'IPV6';
+  }
+  return String(value || '').trim();
+}
+
+function decodeHtmlEntities(text) {
+  return String(text || '')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>');
+}
+
+function clampInteger(value, min, max, fallback) {
+  const number = Number.parseInt(String(value ?? ''), 10);
+  if (!Number.isFinite(number)) {
+    return fallback;
+  }
+  return Math.min(max, Math.max(min, number));
 }
 
 function renderClashProxy(node) {

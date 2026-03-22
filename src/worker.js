@@ -1,9 +1,12 @@
-// Cloudflare Worker: KV short link subscription + access token protection
-// Requires:
-// - KV namespace binding: SUB_STORE
-// - Secret/Variable: SUB_ACCESS_TOKEN
-// Optional:
-// - Secret/Variable: SUB_LINK_SECRET (legacy long-token compatibility)
+import {
+  detectTarget,
+  expandNodes,
+  extractPreferredEndpointsFromContent,
+  parseNodeLinks,
+  parsePreferredEndpoints,
+  renderSubscription,
+  summarizeNodes,
+} from './core.js';
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data, null, 2), {
@@ -17,312 +20,15 @@ function json(data, status = 200) {
   });
 }
 
-function text(body, status = 200, contentType = 'text/plain; charset=utf-8') {
+function text(body, status = 200, contentType = 'text/plain; charset=utf-8', extraHeaders = {}) {
   return new Response(body, {
     status,
     headers: {
       'content-type': contentType,
       'access-control-allow-origin': '*',
+      ...extraHeaders,
     },
   });
-}
-
-function b64EncodeUtf8(str) {
-  return btoa(unescape(encodeURIComponent(str)));
-}
-
-function b64DecodeUtf8(str) {
-  return decodeURIComponent(escape(atob(str)));
-}
-
-function escapeYaml(str = '') {
-  return String(str)
-    .replace(/\\/g, '\\\\')
-    .replace(/"/g, '\\"')
-    .replace(/\n/g, ' ');
-}
-
-function parsePreferredEndpoints(input) {
-  return String(input || '')
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .map((line) => {
-      const [raw, remark = ''] = line.split('#');
-      const value = raw.trim();
-      const hashRemark = remark.trim();
-      const match = value.match(/^(.*?)(?::(\d+))?$/);
-      return {
-        server: match?.[1] || value,
-        port: match?.[2] ? Number(match[2]) : undefined,
-        remark: hashRemark,
-      };
-    });
-}
-
-function parseVmess(link) {
-  const raw = link.slice('vmess://'.length).trim();
-  const obj = JSON.parse(b64DecodeUtf8(raw));
-  return {
-    type: 'vmess',
-    name: obj.ps || 'vmess',
-    server: obj.add,
-    port: Number(obj.port || 443),
-    uuid: obj.id,
-    cipher: obj.scy || 'auto',
-    network: obj.net || 'ws',
-    tls: obj.tls === 'tls',
-    host: obj.host || '',
-    path: obj.path || '/',
-    sni: obj.sni || obj.host || '',
-    alpn: obj.alpn || '',
-    fp: obj.fp || '',
-  };
-}
-
-function parseUrlLike(link, type) {
-  const u = new URL(link);
-  return {
-    type,
-    name: decodeURIComponent(u.hash.replace(/^#/, '')) || type,
-    server: u.hostname,
-    port: Number(u.port || 443),
-    password: type === 'trojan' ? decodeURIComponent(u.username) : undefined,
-    uuid: type === 'vless' ? decodeURIComponent(u.username) : undefined,
-    network: u.searchParams.get('type') || 'tcp',
-    tls: (u.searchParams.get('security') || '').toLowerCase() === 'tls',
-    host: u.searchParams.get('host') || u.searchParams.get('sni') || '',
-    path: u.searchParams.get('path') || '/',
-    sni: u.searchParams.get('sni') || u.searchParams.get('host') || '',
-    fp: u.searchParams.get('fp') || '',
-    alpn: u.searchParams.get('alpn') || '',
-    flow: u.searchParams.get('flow') || '',
-  };
-}
-
-function parseRawLinks(input) {
-  const lines = String(input || '')
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
-
-  const result = [];
-  for (const line of lines) {
-    if (line.startsWith('vmess://')) {
-      result.push(parseVmess(line));
-      continue;
-    }
-    if (line.startsWith('vless://')) {
-      result.push(parseUrlLike(line, 'vless'));
-      continue;
-    }
-    if (line.startsWith('trojan://')) {
-      result.push(parseUrlLike(line, 'trojan'));
-      continue;
-    }
-    try {
-      const decoded = b64DecodeUtf8(line);
-      if (/^(vmess|vless|trojan):\/\//m.test(decoded)) {
-        result.push(...parseRawLinks(decoded));
-      }
-    } catch {}
-  }
-  return result;
-}
-
-function buildNodes(baseNodes, preferredEndpoints, options = {}) {
-  const output = [];
-  const prefix = (options.namePrefix || '').trim();
-  let counter = 0;
-  for (const node of baseNodes) {
-    for (const ep of preferredEndpoints) {
-      counter += 1;
-      const nameParts = [];
-      if (node.name) nameParts.push(node.name);
-      if (prefix) nameParts.push(prefix);
-      if (ep.remark) nameParts.push(ep.remark);
-      else nameParts.push(String(counter));
-      output.push({
-        ...node,
-        name: nameParts.join(' | '),
-        server: ep.server,
-        port: ep.port || node.port,
-        host: options.keepOriginalHost ? node.host : '',
-        sni: options.keepOriginalHost ? node.sni : '',
-      });
-    }
-  }
-  return output;
-}
-
-function encodeVmess(node) {
-  const obj = {
-    v: '2',
-    ps: node.name,
-    add: node.server,
-    port: String(node.port),
-    id: node.uuid,
-    aid: '0',
-    scy: node.cipher || 'auto',
-    net: node.network || 'ws',
-    type: 'none',
-    host: node.host || '',
-    path: node.path || '/',
-    tls: node.tls ? 'tls' : '',
-    sni: node.sni || '',
-    alpn: node.alpn || '',
-    fp: node.fp || '',
-  };
-  return 'vmess://' + b64EncodeUtf8(JSON.stringify(obj));
-}
-
-function encodeVless(node) {
-  const url = new URL(`vless://${encodeURIComponent(node.uuid)}@${node.server}:${node.port}`);
-  url.searchParams.set('type', node.network || 'ws');
-  if (node.tls) url.searchParams.set('security', 'tls');
-  if (node.host) url.searchParams.set('host', node.host);
-  if (node.sni) url.searchParams.set('sni', node.sni);
-  if (node.path) url.searchParams.set('path', node.path);
-  if (node.alpn) url.searchParams.set('alpn', node.alpn);
-  if (node.fp) url.searchParams.set('fp', node.fp);
-  if (node.flow) url.searchParams.set('flow', node.flow);
-  url.hash = node.name;
-  return url.toString();
-}
-
-function encodeTrojan(node) {
-  const url = new URL(`trojan://${encodeURIComponent(node.password)}@${node.server}:${node.port}`);
-  if (node.network) url.searchParams.set('type', node.network);
-  if (node.tls) url.searchParams.set('security', 'tls');
-  if (node.host) url.searchParams.set('host', node.host);
-  if (node.sni) url.searchParams.set('sni', node.sni);
-  if (node.path) url.searchParams.set('path', node.path);
-  if (node.alpn) url.searchParams.set('alpn', node.alpn);
-  if (node.fp) url.searchParams.set('fp', node.fp);
-  url.hash = node.name;
-  return url.toString();
-}
-
-function renderRaw(nodes) {
-  const lines = nodes
-    .map((node) => {
-      if (node.type === 'vmess') return encodeVmess(node);
-      if (node.type === 'vless') return encodeVless(node);
-      if (node.type === 'trojan') return encodeTrojan(node);
-      return '';
-    })
-    .filter(Boolean);
-  return b64EncodeUtf8(lines.join('\n'));
-}
-
-function renderClash(nodes) {
-  const proxies = nodes
-    .map((node) => {
-      if (node.type === 'vmess') {
-        return [
-          `  - name: "${escapeYaml(node.name)}"`,
-          `    type: vmess`,
-          `    server: ${node.server}`,
-          `    port: ${node.port}`,
-          `    uuid: ${node.uuid}`,
-          `    alterId: 0`,
-          `    cipher: ${node.cipher || 'auto'}`,
-          `    tls: ${node.tls ? 'true' : 'false'}`,
-          `    network: ${node.network || 'ws'}`,
-          `    servername: "${escapeYaml(node.sni || '')}"`,
-          `    ws-opts:`,
-          `      path: "${escapeYaml(node.path || '/')}"`,
-          `      headers:`,
-          `        Host: "${escapeYaml(node.host || '')}"`,
-        ].join('\n');
-      }
-      if (node.type === 'vless') {
-        return [
-          `  - name: "${escapeYaml(node.name)}"`,
-          `    type: vless`,
-          `    server: ${node.server}`,
-          `    port: ${node.port}`,
-          `    uuid: ${node.uuid}`,
-          `    tls: ${node.tls ? 'true' : 'false'}`,
-          `    network: ${node.network || 'ws'}`,
-          `    servername: "${escapeYaml(node.sni || '')}"`,
-          `    ws-opts:`,
-          `      path: "${escapeYaml(node.path || '/')}"`,
-          `      headers:`,
-          `        Host: "${escapeYaml(node.host || '')}"`,
-        ].join('\n');
-      }
-      if (node.type === 'trojan') {
-        return [
-          `  - name: "${escapeYaml(node.name)}"`,
-          `    type: trojan`,
-          `    server: ${node.server}`,
-          `    port: ${node.port}`,
-          `    password: "${escapeYaml(node.password || '')}"`,
-          `    sni: "${escapeYaml(node.sni || '')}"`,
-          `    network: ${node.network || 'ws'}`,
-          `    ws-opts:`,
-          `      path: "${escapeYaml(node.path || '/')}"`,
-          `      headers:`,
-          `        Host: "${escapeYaml(node.host || '')}"`,
-        ].join('\n');
-      }
-      return '';
-    })
-    .filter(Boolean);
-
-  return ['proxies:', ...proxies].join('\n');
-}
-
-function renderSurge(nodes, baseUrl, accessToken) {
-  const proxies = nodes
-    .filter((node) => node.type === 'vmess' || node.type === 'trojan')
-    .map((node) => {
-      if (node.type === 'vmess') {
-        return `${node.name} = vmess, ${node.server}, ${node.port}, username=${node.uuid}, ws=true, ws-path=${node.path || '/'}, ws-headers=Host:${node.host || ''}, tls=${node.tls ? 'true' : 'false'}, sni=${node.sni || ''}`;
-      }
-      return `${node.name} = trojan, ${node.server}, ${node.port}, password=${node.password || ''}, sni=${node.sni || ''}`;
-    });
-
-  return [
-    '[General]',
-    'skip-proxy = 127.0.0.1, localhost',
-    '',
-    '[Proxy]',
-    ...proxies,
-    '',
-    '[Proxy Group]',
-    'Proxy = select, ' +
-      nodes
-        .filter((n) => n.type === 'vmess' || n.type === 'trojan')
-        .map((n) => n.name)
-        .join(', '),
-    '',
-    '[Rule]',
-    'FINAL,Proxy',
-    '',
-    '; token-protected subscription',
-    `; ${baseUrl}?token=${accessToken}`,
-  ].join('\n');
-}
-
-function createShortId(length = 10) {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789';
-  const bytes = crypto.getRandomValues(new Uint8Array(length));
-  let out = '';
-  for (let i = 0; i < length; i++) {
-    out += chars[bytes[i] % chars.length];
-  }
-  return out;
-}
-
-async function createUniqueShortId(env, tries = 8) {
-  for (let i = 0; i < tries; i++) {
-    const id = createShortId(10);
-    const exists = await env.SUB_STORE.get(`sub:${id}`);
-    if (!exists) return id;
-  }
-  throw new Error('无法生成唯一短链接，请稍后再试');
 }
 
 function normalizeLines(value = '') {
@@ -334,11 +40,60 @@ function normalizeLines(value = '') {
     .join('\n');
 }
 
+function clampInteger(value, min, max, fallback) {
+  const number = Number.parseInt(String(value ?? ''), 10);
+  if (!Number.isFinite(number)) {
+    return fallback;
+  }
+  return Math.min(max, Math.max(min, number));
+}
+
+function normalizeCarrierFilters(value = '') {
+  return String(value)
+    .split(/[\n,;]+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function normalizeHttpUrl(value = '') {
+  const raw = String(value || '').trim();
+  if (!raw) {
+    return '';
+  }
+
+  const url = new URL(raw);
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    throw new Error('远程优选源只支持 http / https 链接。');
+  }
+  return url.toString();
+}
+
+function createShortId(length = 10) {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789';
+  const bytes = crypto.getRandomValues(new Uint8Array(length));
+  let out = '';
+  for (let index = 0; index < length; index += 1) {
+    out += chars[bytes[index] % chars.length];
+  }
+  return out;
+}
+
+async function createUniqueShortId(env, tries = 8) {
+  for (let attempt = 0; attempt < tries; attempt += 1) {
+    const id = createShortId(10);
+    const exists = await env.SUB_STORE.get(`sub:${id}`);
+    if (!exists) {
+      return id;
+    }
+  }
+  throw new Error('无法生成唯一订阅标识，请稍后再试。');
+}
+
 async function sha256Hex(input) {
   const data = new TextEncoder().encode(input);
   const digest = await crypto.subtle.digest('SHA-256', data);
   return [...new Uint8Array(digest)]
-    .map((b) => b.toString(16).padStart(2, '0'))
+    .map((byte) => byte.toString(16).padStart(2, '0'))
     .join('');
 }
 
@@ -346,10 +101,217 @@ async function buildDedupHash(body) {
   const normalized = {
     nodeLinks: normalizeLines(body.nodeLinks || ''),
     preferredIps: normalizeLines(body.preferredIps || ''),
+    remoteSourceUrl: String(body.remoteSourceUrl || '').trim(),
+    refreshHours: clampInteger(body.refreshHours, 1, 24, 3),
+    remoteDefaultPort: clampInteger(body.remoteDefaultPort, 1, 65535, 443),
+    remoteCarrierFilters: normalizeCarrierFilters(body.remoteCarrierFilters || '').sort(),
+    maxEndpoints: clampInteger(body.maxEndpoints, 1, 200, 12),
     namePrefix: String(body.namePrefix || '').trim(),
     keepOriginalHost: body.keepOriginalHost !== false,
   };
   return sha256Hex(JSON.stringify(normalized));
+}
+
+function buildSubscriptionUrls(origin, id, accessToken = '') {
+  const build = (target) => {
+    const params = new URLSearchParams();
+    if (target) {
+      params.set('target', target);
+    }
+    if (accessToken) {
+      params.set('token', accessToken);
+    }
+    const query = params.toString();
+    return `${origin}/sub/${id}${query ? `?${query}` : ''}`;
+  };
+
+  return {
+    auto: build('auto'),
+    raw: build('raw'),
+    clash: build('clash'),
+    surge: build('surge'),
+    json: build('json'),
+  };
+}
+
+function validateAccessToken(url, env) {
+  const expected = env.SUB_ACCESS_TOKEN;
+  if (!expected) {
+    return { ok: true };
+  }
+
+  const provided = url.searchParams.get('token') || '';
+  if (provided !== expected) {
+    return { ok: false, response: text('Forbidden: invalid token', 403) };
+  }
+
+  return { ok: true };
+}
+
+function buildSourceConfig(body) {
+  return {
+    manualPreferredIps: normalizeLines(body.preferredIps || ''),
+    remoteSourceUrl: normalizeHttpUrl(body.remoteSourceUrl || ''),
+    refreshHours: clampInteger(body.refreshHours, 1, 24, 3),
+    remoteDefaultPort: clampInteger(body.remoteDefaultPort, 1, 65535, 443),
+    remoteCarrierFilters: normalizeCarrierFilters(body.remoteCarrierFilters || ''),
+    maxEndpoints: clampInteger(body.maxEndpoints, 1, 200, 12),
+  };
+}
+
+async function fetchRemoteEndpoints(sourceConfig) {
+  const response = await fetch(sourceConfig.remoteSourceUrl, {
+    headers: {
+      'user-agent': 'cloudflare-sub-worker/2.0',
+      accept: 'text/html,text/plain;q=0.9,*/*;q=0.8',
+    },
+    cf: {
+      cacheEverything: false,
+      cacheTtl: 0,
+    },
+  });
+
+  if (!response.ok) {
+    throw new Error(`远程源返回 ${response.status}`);
+  }
+
+  const content = await response.text();
+  const { endpoints, warnings } = extractPreferredEndpointsFromContent(content, {
+    defaultPort: sourceConfig.remoteDefaultPort,
+    carrierFilters: sourceConfig.remoteCarrierFilters,
+    maxEndpoints: sourceConfig.maxEndpoints,
+  });
+
+  if (!endpoints.length) {
+    throw new Error(warnings[0] || '远程页面中没有解析到可用优选 IP。');
+  }
+
+  return {
+    endpoints,
+    warnings,
+    fetchedAt: new Date().toISOString(),
+  };
+}
+
+function isCacheFresh(cache, refreshHours) {
+  if (!cache?.fetchedAt) {
+    return false;
+  }
+
+  const fetchedAt = Date.parse(cache.fetchedAt);
+  if (!Number.isFinite(fetchedAt)) {
+    return false;
+  }
+
+  return Date.now() - fetchedAt < refreshHours * 60 * 60 * 1000;
+}
+
+async function resolveEndpoints(sourceConfig, cache, saveCache) {
+  const warnings = [];
+
+  if (!sourceConfig.remoteSourceUrl) {
+    const manualResult = parsePreferredEndpoints(sourceConfig.manualPreferredIps || '');
+    return {
+      endpoints: manualResult.endpoints,
+      warnings: [...manualResult.warnings],
+      metadata: {
+        mode: 'manual',
+        fetchedAt: null,
+      },
+    };
+  }
+
+  if (isCacheFresh(cache, sourceConfig.refreshHours) && cache?.endpoints?.length) {
+    return {
+      endpoints: cache.endpoints,
+      warnings,
+      metadata: {
+        mode: 'remote-cache',
+        fetchedAt: cache.fetchedAt,
+      },
+    };
+  }
+
+  try {
+    const remoteResult = await fetchRemoteEndpoints(sourceConfig);
+    if (typeof saveCache === 'function') {
+      await saveCache({
+        endpoints: remoteResult.endpoints,
+        fetchedAt: remoteResult.fetchedAt,
+      });
+    }
+
+    return {
+      endpoints: remoteResult.endpoints,
+      warnings: [...remoteResult.warnings],
+      metadata: {
+        mode: 'remote-live',
+        fetchedAt: remoteResult.fetchedAt,
+      },
+    };
+  } catch (error) {
+    if (cache?.endpoints?.length) {
+      warnings.push(`远程优选源刷新失败，已回退到 ${cache.fetchedAt} 的缓存：${error.message}`);
+      return {
+        endpoints: cache.endpoints,
+        warnings,
+        metadata: {
+          mode: 'remote-stale-cache',
+          fetchedAt: cache.fetchedAt,
+        },
+      };
+    }
+
+    if (sourceConfig.manualPreferredIps) {
+      const manualResult = parsePreferredEndpoints(sourceConfig.manualPreferredIps);
+      warnings.push(`远程优选源拉取失败，已回退到手动备用 IP：${error.message}`);
+      warnings.push(...manualResult.warnings);
+      return {
+        endpoints: manualResult.endpoints,
+        warnings,
+        metadata: {
+          mode: 'manual-fallback',
+          fetchedAt: null,
+        },
+      };
+    }
+
+    throw error;
+  }
+}
+
+async function buildNodesFromRecord(record, env, id) {
+  if (Array.isArray(record.nodes) && !record.baseNodes) {
+    return {
+      nodes: record.nodes,
+      warnings: [],
+      metadata: {
+        mode: 'legacy-static',
+        fetchedAt: record.createdAt || null,
+      },
+    };
+  }
+
+  const baseNodes = Array.isArray(record.baseNodes) ? record.baseNodes : [];
+  if (!baseNodes.length) {
+    throw new Error('订阅记录中没有可用节点。');
+  }
+
+  const resolved = await resolveEndpoints(record.sourceConfig || {}, record.cache, async (nextCache) => {
+    const updatedRecord = {
+      ...record,
+      cache: nextCache,
+      updatedAt: new Date().toISOString(),
+    };
+    await env.SUB_STORE.put(`sub:${id}`, JSON.stringify(updatedRecord));
+  });
+
+  const expanded = expandNodes(baseNodes, resolved.endpoints, record.options || {});
+  return {
+    nodes: expanded.nodes,
+    warnings: [...resolved.warnings, ...expanded.warnings],
+    metadata: resolved.metadata,
+  };
 }
 
 async function handleGenerate(request, env, url) {
@@ -357,119 +319,142 @@ async function handleGenerate(request, env, url) {
   try {
     body = await request.json();
   } catch {
-    return json({ ok: false, error: '请求体不是合法 JSON' }, 400);
+    return json({ ok: false, error: '请求体不是有效的 JSON。' }, 400);
   }
 
-  const baseNodes = parseRawLinks(body.nodeLinks || '');
-  const preferredEndpoints = parsePreferredEndpoints(body.preferredIps || '');
+  let baseNodeResult;
+  try {
+    baseNodeResult = parseNodeLinks(body.nodeLinks || '');
+  } catch (error) {
+    return json({ ok: false, error: error.message }, 400);
+  }
 
-  if (!baseNodes.length) return json({ ok: false, error: '没有识别到可用节点' }, 400);
-  if (!preferredEndpoints.length) return json({ ok: false, error: '没有识别到可用优选地址' }, 400);
+  let sourceConfig;
+  try {
+    sourceConfig = buildSourceConfig(body);
+  } catch (error) {
+    return json({ ok: false, error: error.message }, 400);
+  }
+
+  if (!sourceConfig.manualPreferredIps && !sourceConfig.remoteSourceUrl) {
+    return json({ ok: false, error: '请至少填写手动优选 IP，或者提供远程优选源 URL。' }, 400);
+  }
 
   const options = {
-    namePrefix: body.namePrefix || '',
+    namePrefix: String(body.namePrefix || '').trim(),
     keepOriginalHost: body.keepOriginalHost !== false,
   };
 
-  const nodes = buildNodes(baseNodes, preferredEndpoints, options);
+  let resolved;
+  try {
+    resolved = await resolveEndpoints(sourceConfig, null);
+  } catch (error) {
+    return json({ ok: false, error: `生成预览失败：${error.message}` }, 502);
+  }
+
+  const expanded = expandNodes(baseNodeResult.nodes, resolved.endpoints, options);
 
   const payload = {
-    version: 1,
+    version: 2,
     createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    baseNodes: baseNodeResult.nodes,
     options,
-    nodes,
+    sourceConfig,
+    cache:
+      resolved.metadata.fetchedAt && resolved.endpoints.length
+        ? {
+            endpoints: resolved.endpoints,
+            fetchedAt: resolved.metadata.fetchedAt,
+          }
+        : null,
   };
 
   const dedupHash = await buildDedupHash(body);
   const dedupKey = `dedup:${dedupHash}`;
 
   let id = await env.SUB_STORE.get(dedupKey);
-
   if (!id) {
     id = await createUniqueShortId(env);
-    const ttl = 60 * 60 * 24 * 7; // 7天
-
-    await env.SUB_STORE.put(`sub:${id}`, JSON.stringify(payload), {
-      expirationTtl: ttl,
-    });
-
-    await env.SUB_STORE.put(dedupKey, id, {
-      expirationTtl: ttl,
-    });
+    await env.SUB_STORE.put(dedupKey, id);
   }
 
-  const origin = url.origin;
+  await env.SUB_STORE.put(`sub:${id}`, JSON.stringify(payload));
+
   const accessToken = env.SUB_ACCESS_TOKEN || '';
-  const withToken = (target) =>
-    `${origin}/sub/${id}${
-      target
-        ? `?target=${target}&token=${encodeURIComponent(accessToken)}`
-        : `?token=${encodeURIComponent(accessToken)}`
-    }`;
+  const urls = buildSubscriptionUrls(url.origin, id, accessToken);
 
   return json({
     ok: true,
     storage: 'kv',
-    deduplicated: true,
     shortId: id,
-    urls: {
-      auto: withToken(''),
-      raw: withToken('raw'),
-      clash: withToken('clash'),
-      surge: withToken('surge'),
-    },
+    urls,
     counts: {
-      inputNodes: baseNodes.length,
-      preferredEndpoints: preferredEndpoints.length,
-      outputNodes: nodes.length,
+      inputNodes: baseNodeResult.nodes.length,
+      preferredEndpoints: resolved.endpoints.length,
+      outputNodes: expanded.nodes.length,
     },
-    preview: nodes.slice(0, 20).map((node) => ({
-      name: node.name,
-      type: node.type,
-      server: node.server,
-      port: node.port,
-      host: node.host || '',
-      sni: node.sni || '',
-    })),
-    warnings: accessToken ? [] : ['未检测到 SUB_ACCESS_TOKEN，订阅链接将没有第二层访问保护。'],
+    source: {
+      mode: sourceConfig.remoteSourceUrl ? 'remote' : 'manual',
+      remoteSourceUrl: sourceConfig.remoteSourceUrl || null,
+      refreshHours: sourceConfig.remoteSourceUrl ? sourceConfig.refreshHours : null,
+      carrierFilters: sourceConfig.remoteCarrierFilters,
+      maxEndpoints: sourceConfig.maxEndpoints,
+      lastFetchedAt: resolved.metadata.fetchedAt,
+    },
+    preview: summarizeNodes(expanded.nodes, 20),
+    warnings: [...baseNodeResult.warnings, ...resolved.warnings, ...expanded.warnings],
   });
 }
 
-function validateAccessToken(url, env) {
-  const expected = env.SUB_ACCESS_TOKEN;
-  if (!expected) return { ok: true };
-  const provided = url.searchParams.get('token') || '';
-  if (!provided || provided !== expected) {
-    return { ok: false, response: text('Forbidden: invalid token', 403) };
-  }
-  return { ok: true };
-}
-
-async function handleSub(url, env) {
+async function handleSub(request, url, env) {
   const tokenCheck = validateAccessToken(url, env);
-  if (!tokenCheck.ok) return tokenCheck.response;
+  if (!tokenCheck.ok) {
+    return tokenCheck.response;
+  }
 
   const id = url.pathname.split('/').pop();
-  if (!id) return text('missing id', 400);
+  if (!id) {
+    return text('missing id', 400);
+  }
 
   const raw = await env.SUB_STORE.get(`sub:${id}`);
-  if (!raw) return text('not found', 404);
+  if (!raw) {
+    return text('not found', 404);
+  }
 
   const record = JSON.parse(raw);
-  const nodes = record.nodes || [];
-  const target = (url.searchParams.get('target') || 'raw').toLowerCase();
 
-  if (target === 'clash') {
-    return text(renderClash(nodes), 200, 'text/yaml; charset=utf-8');
+  let built;
+  try {
+    built = await buildNodesFromRecord(record, env, id);
+  } catch (error) {
+    return text(`subscription build failed: ${error.message}`, 502);
   }
-  if (target === 'surge') {
-    return text(
-      renderSurge(nodes, url.origin + url.pathname, env.SUB_ACCESS_TOKEN || ''),
-      200,
-      'text/plain; charset=utf-8',
-    );
+
+  const target = detectTarget(
+    request.headers.get('user-agent') || '',
+    url.searchParams.get('target') || 'auto',
+  );
+
+  let rendered;
+  try {
+    const requestUrl = new URL(url.toString());
+    requestUrl.searchParams.set('target', target);
+    rendered = renderSubscription(target, built.nodes, requestUrl.toString());
+  } catch (error) {
+    return text(`render failed: ${error.message}`, 500);
   }
-  return text(renderRaw(nodes), 200, 'text/plain; charset=utf-8');
+
+  const headers = {};
+  if (built.metadata.fetchedAt) {
+    headers['x-sub-last-fetched-at'] = built.metadata.fetchedAt;
+  }
+  if (built.warnings.length) {
+    headers['x-sub-warning-count'] = String(built.warnings.length);
+  }
+
+  return text(rendered.body, 200, rendered.contentType, headers);
 }
 
 export default {
@@ -491,7 +476,7 @@ export default {
     }
 
     if (request.method === 'GET' && url.pathname.startsWith('/sub/')) {
-      return handleSub(url, env);
+      return handleSub(request, url, env);
     }
 
     return env.ASSETS.fetch(request);

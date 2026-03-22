@@ -26,9 +26,15 @@ const demoIps = [
   '104.18.3.4:2053#US-Edge'
 ].join('\n');
 
+const demoRemoteUrl = 'https://api.uouin.com/cloudflare.html';
+
 fillDemoBtn.addEventListener('click', () => {
   document.getElementById('nodeLinks').value = demoVmess;
   document.getElementById('preferredIps').value = demoIps;
+  document.getElementById('remoteSourceUrl').value = demoRemoteUrl;
+  document.getElementById('refreshHours').value = '3';
+  document.getElementById('remoteCarrierFilters').value = '电信,联通,移动';
+  document.getElementById('maxEndpoints').value = '12';
   document.getElementById('namePrefix').value = 'CF';
   document.getElementById('keepOriginalHost').checked = true;
 });
@@ -41,6 +47,11 @@ form.addEventListener('submit', async (event) => {
   const payload = {
     nodeLinks: document.getElementById('nodeLinks').value,
     preferredIps: document.getElementById('preferredIps').value,
+    remoteSourceUrl: document.getElementById('remoteSourceUrl').value,
+    refreshHours: document.getElementById('refreshHours').value,
+    remoteCarrierFilters: document.getElementById('remoteCarrierFilters').value,
+    maxEndpoints: document.getElementById('maxEndpoints').value,
+    remoteDefaultPort: '443',
     namePrefix: document.getElementById('namePrefix').value,
     keepOriginalHost: document.getElementById('keepOriginalHost').checked,
   };
