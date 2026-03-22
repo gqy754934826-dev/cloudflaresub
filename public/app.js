@@ -68,7 +68,18 @@ form.addEventListener('submit', async (event) => {
       body: JSON.stringify(payload),
     });
 
-    const data = await response.json();
+    const contentType = response.headers.get('content-type') || '';
+    const rawBody = await response.text();
+    let data = null;
+
+    if (contentType.includes('application/json')) {
+      data = JSON.parse(rawBody);
+    } else {
+      const snippet = rawBody.replace(/\s+/g, ' ').trim().slice(0, 160);
+      throw new Error(
+        `接口 /api/generate 没有返回 JSON，实际返回的是 ${contentType || 'unknown'}。这通常表示当前站点是静态托管，或者 Worker/API 路由没有生效。返回片段：${snippet}`,
+      );
+    }
     if (!response.ok || !data.ok) {
       throw new Error(data.error || '生成失败');
     }
