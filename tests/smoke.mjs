@@ -3,6 +3,7 @@ import {
   decryptPayload,
   encryptPayload,
   expandNodes,
+  extractLatestTimestampFromContent,
   extractPreferredEndpointsFromContent,
   parseNodeLinks,
   parsePreferredEndpoints,
@@ -95,7 +96,7 @@ const remoteHtmlNoCarrier = extractPreferredEndpointsFromContent(
   `,
   {
     defaultPort: 443,
-    carrierFilters: '',
+    carrierFilters: `${CARRIER_TELECOM},${CARRIER_MOBILE}`,
     maxEndpoints: 2,
   },
 );
@@ -103,6 +104,14 @@ assert.equal(remoteHtmlNoCarrier.parser, 'html');
 assert.equal(remoteHtmlNoCarrier.endpoints.length, 2);
 assert.equal(remoteHtmlNoCarrier.endpoints[0].host, '104.16.40.1');
 assert.equal(remoteHtmlNoCarrier.endpoints[1].host, '104.17.50.2');
+
+const latestTimestamp = extractLatestTimestampFromContent(
+  `
+  更新时间：2026-03-22 10:30:15
+  数据生成于 2026/03/22 09:20:00
+  `,
+);
+assert.equal(latestTimestamp, '2026-03-22T02:30:15.000Z');
 
 const raw = renderRawSubscription(expanded.nodes);
 assert.ok(raw.length > 10);

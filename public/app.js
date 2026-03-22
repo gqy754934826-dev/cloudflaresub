@@ -33,6 +33,7 @@ fillDemoBtn.addEventListener('click', () => {
   document.getElementById('preferredIps').value = demoIps;
   document.getElementById('remoteSourceUrl').value = demoRemoteUrl;
   document.getElementById('refreshHours').value = '3';
+  document.getElementById('remoteMaxAgeHours').value = '6';
   document.getElementById('remoteCarrierFilters').value = '电信,联通,移动';
   document.getElementById('maxEndpoints').value = '12';
   document.getElementById('namePrefix').value = 'CF';
@@ -49,6 +50,7 @@ form.addEventListener('submit', async (event) => {
     preferredIps: document.getElementById('preferredIps').value,
     remoteSourceUrl: document.getElementById('remoteSourceUrl').value,
     refreshHours: document.getElementById('refreshHours').value,
+    remoteMaxAgeHours: document.getElementById('remoteMaxAgeHours').value,
     remoteCarrierFilters: document.getElementById('remoteCarrierFilters').value,
     maxEndpoints: document.getElementById('maxEndpoints').value,
     remoteDefaultPort: '443',

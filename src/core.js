@@ -798,7 +798,7 @@ function extractEndpointsFromHtmlContent(inputText, context) {
     }
   }
 
-  if (!candidates.length && !context.carrierFilters.length) {
+  if (!candidates.length) {
     for (const line of lines) {
       const hosts = [...line.matchAll(HOST_GLOBAL_PATTERN)];
       if (!hosts.length) {
@@ -907,6 +907,9 @@ function parseEndpointCandidateFromLine(line, defaultPort) {
 function buildPreferredEndpointsFromCandidates(candidates, context, parserName) {
   const filterList = context.carrierFilters;
   const allowedCarriers = new Set(filterList);
+  const hasCarrierCandidates = candidates.some((candidate) =>
+    Boolean(normalizeCarrierName(candidate.carrier)),
+  );
   const counters = new Map();
   const buckets = new Map();
   const standalone = [];
@@ -923,7 +926,7 @@ function buildPreferredEndpointsFromCandidates(candidates, context, parserName) 
     if (allowedCarriers.size && carrier && !allowedCarriers.has(carrier)) {
       continue;
     }
-    if (allowedCarriers.size && !carrier) {
+    if (allowedCarriers.size && !carrier && hasCarrierCandidates) {
       continue;
     }
 
@@ -982,6 +985,121 @@ function buildPreferredEndpointsFromCandidates(candidates, context, parserName) 
     endpoints,
     warnings: endpoints.length ? [] : [`${parserName} parser did not find any usable endpoints.`],
   };
+}
+
+export function extractLatestTimestampFromContent(inputText, options = {}) {
+  const contentType = String(options.contentType || '').toLowerCase();
+  const timestamps = [];
+
+  if (contentType.includes('json')) {
+    try {
+      collectTimestampCandidates(JSON.parse(String(inputText || '')), timestamps);
+    } catch {}
+  }
+
+  collectTimestampCandidates(String(inputText || ''), timestamps);
+
+  const now = Date.now();
+  const valid = timestamps
+    .map((value) => normalizeCandidateTimestamp(value))
+    .filter((value) => Number.isFinite(value) && value <= now + 5 * 60 * 1000);
+
+  if (!valid.length) {
+    return null;
+  }
+
+  return new Date(Math.max(...valid)).toISOString();
+}
+
+function collectTimestampCandidates(value, output) {
+  if (typeof value === 'string') {
+    output.push(...extractTimestampStrings(value));
+    return;
+  }
+
+  if (typeof value === 'number') {
+    output.push(value);
+    return;
+  }
+
+  if (Array.isArray(value)) {
+    value.forEach((item) => collectTimestampCandidates(item, output));
+    return;
+  }
+
+  if (!value || typeof value !== 'object') {
+    return;
+  }
+
+  for (const [key, child] of Object.entries(value)) {
+    if (/(time|date|updated|created|timestamp)/i.test(key)) {
+      output.push(child);
+    }
+    collectTimestampCandidates(child, output);
+  }
+}
+
+function extractTimestampStrings(text) {
+  const matches = [];
+  const source = decodeHtmlEntities(String(text || ''));
+  const patterns = [
+    /\b20\d{2}[-/.]\d{1,2}[-/.]\d{1,2}[ T]\d{1,2}:\d{2}(?::\d{2})?(?:\s*(?:Z|[+-]\d{2}:?\d{2}))?\b/g,
+    /\b20\d{2}[-/.]\d{1,2}[-/.]\d{1,2}\b/g,
+    /\b1\d{12}\b/g,
+    /\b1\d{9}\b/g,
+  ];
+
+  for (const pattern of patterns) {
+    matches.push(...source.match(pattern) || []);
+  }
+
+  return matches;
+}
+
+function normalizeCandidateTimestamp(value) {
+  if (typeof value === 'number') {
+    if (value > 1e12) {
+      return value;
+    }
+    if (value > 1e9) {
+      return value * 1000;
+    }
+    return NaN;
+  }
+
+  const text = String(value || '').trim();
+  if (!text) {
+    return NaN;
+  }
+
+  if (/^\d{13}$/.test(text)) {
+    return Number(text);
+  }
+  if (/^\d{10}$/.test(text)) {
+    return Number(text) * 1000;
+  }
+
+  const isoParsed = Date.parse(text);
+  if (Number.isFinite(isoParsed) && /(?:z|[+-]\d{2}:?\d{2})$/i.test(text)) {
+    return isoParsed;
+  }
+
+  const match = text.match(
+    /^(?<year>20\d{2})[-/.](?<month>\d{1,2})[-/.](?<day>\d{1,2})(?:[ T](?<hour>\d{1,2}):(?<minute>\d{2})(?::(?<second>\d{2}))?)?$/,
+  );
+  if (!match?.groups) {
+    return Number.isFinite(isoParsed) ? isoParsed : NaN;
+  }
+
+  const year = Number(match.groups.year);
+  const month = Number(match.groups.month) - 1;
+  const day = Number(match.groups.day);
+  const hour = Number(match.groups.hour || 0);
+  const minute = Number(match.groups.minute || 0);
+  const second = Number(match.groups.second || 0);
+
+  // Source pages are China-oriented; infer +08:00 when timezone is omitted.
+  return Date.UTC(year, month, day, hour - 8, minute, second);
 }
 
 function buildCarrierLabel(carrier, rawLabel, count) {
@@ -1044,6 +1162,9 @@ function normalizeCarrierFilters(input) {
 
 function normalizeCarrierName(value) {
   const text = String(value || '').trim().toLowerCase();
+  if (!text) {
+    return '';
+  }
   if (text === 'ct' || text === 'telecom' || text === CARRIER_NAMES.telecom.toLowerCase()) {
     return CARRIER_NAMES.telecom;
   }
@@ -1059,6 +1180,7 @@ function normalizeCarrierName(value) {
   if (text === 'ipv6' || text === 'ip6') {
     return CARRIER_NAMES.ipv6;
   }
+  return String(value || '').trim();
   if (!text) {
     return '';
   }

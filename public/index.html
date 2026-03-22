@@ -87,7 +87,13 @@ cf.example.com:443#US-Edge"
           </div>
 
           <div>
-            <label for="remoteCarrierFilters">6. 线路筛选</label>
+            <label for="remoteMaxAgeHours">6. 远程源最大允许陈旧（小时）</label>
+            <input id="remoteMaxAgeHours" name="remoteMaxAgeHours" type="number" min="1" max="168" value="6" />
+            <p class="hint">如果远程页面里带有更新时间，且早于这个阈值，系统会拒绝使用旧数据并回退到缓存或手动备用 IP。</p>
+          </div>
+
+          <div>
+            <label for="remoteCarrierFilters">7. 线路筛选</label>
             <input
               id="remoteCarrierFilters"
               name="remoteCarrierFilters"
@@ -100,7 +106,7 @@ cf.example.com:443#US-Edge"
 
           <div class="grid two-col compact">
             <div>
-              <label for="namePrefix">7. 节点名前缀（可选）</label>
+              <label for="namePrefix">8. 节点名前缀（可选）</label>
               <input id="namePrefix" name="namePrefix" type="text" placeholder="例如 CF" />
             </div>
             <div class="checkbox-wrap">

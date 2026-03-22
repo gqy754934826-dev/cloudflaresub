@@ -2,6 +2,7 @@ import {
   detectTarget,
   expandNodes,
   extractPreferredEndpointsFromContent,
+  extractLatestTimestampFromContent,
   parseNodeLinks,
   parsePreferredEndpoints,
   renderSubscription,
@@ -105,6 +106,7 @@ async function buildDedupHash(body) {
     refreshHours: clampInteger(body.refreshHours, 1, 24, 3),
     remoteDefaultPort: clampInteger(body.remoteDefaultPort, 1, 65535, 443),
     remoteCarrierFilters: normalizeCarrierFilters(body.remoteCarrierFilters || '').sort(),
+    remoteMaxAgeHours: clampInteger(body.remoteMaxAgeHours, 1, 168, 6),
     maxEndpoints: clampInteger(body.maxEndpoints, 1, 200, 12),
     namePrefix: String(body.namePrefix || '').trim(),
     keepOriginalHost: body.keepOriginalHost !== false,
@@ -155,6 +157,7 @@ function buildSourceConfig(body) {
     refreshHours: clampInteger(body.refreshHours, 1, 24, 3),
     remoteDefaultPort: clampInteger(body.remoteDefaultPort, 1, 65535, 443),
     remoteCarrierFilters: normalizeCarrierFilters(body.remoteCarrierFilters || ''),
+    remoteMaxAgeHours: clampInteger(body.remoteMaxAgeHours, 1, 168, 6),
     maxEndpoints: clampInteger(body.maxEndpoints, 1, 200, 12),
   };
 }
@@ -186,12 +189,25 @@ async function fetchRemoteEndpoints(sourceConfig) {
 
   const contentType = response.headers.get('content-type') || '';
   const content = await response.text();
+  const sourceUpdatedAt = extractLatestTimestampFromContent(content, { contentType });
   const { endpoints, warnings, parser } = extractPreferredEndpointsFromContent(content, {
     defaultPort: sourceConfig.remoteDefaultPort,
     carrierFilters: sourceConfig.remoteCarrierFilters,
     maxEndpoints: sourceConfig.maxEndpoints,
     contentType,
   });
+
+  if (sourceUpdatedAt) {
+    const maxAgeMs = sourceConfig.remoteMaxAgeHours * 60 * 60 * 1000;
+    const sourceAgeMs = Date.now() - Date.parse(sourceUpdatedAt);
+    if (Number.isFinite(sourceAgeMs) && sourceAgeMs > maxAgeMs) {
+      throw new Error(
+        `远程源数据时间过旧：${sourceUpdatedAt}，超过 ${sourceConfig.remoteMaxAgeHours} 小时`,
+      );
+    }
+  } else {
+    warnings.push('未识别到远程源更新时间，无法验证是否为最新数据。');
+  }
 
   if (!endpoints.length) {
     throw new Error(warnings[0] || '远程页面中没有解析到可用优选 IP。');
@@ -201,6 +217,7 @@ async function fetchRemoteEndpoints(sourceConfig) {
     endpoints,
     warnings,
     parser,
+    sourceUpdatedAt,
     fetchedAt: new Date().toISOString(),
   };
 }
@@ -230,6 +247,7 @@ async function resolveEndpoints(sourceConfig, cache, saveCache) {
         mode: 'manual',
         fetchedAt: null,
         parser: 'manual',
+        sourceUpdatedAt: null,
       },
     };
   }
@@ -242,6 +260,7 @@ async function resolveEndpoints(sourceConfig, cache, saveCache) {
         mode: 'remote-cache',
         fetchedAt: cache.fetchedAt,
         parser: cache.parser || 'cache',
+        sourceUpdatedAt: cache.sourceUpdatedAt || null,
       },
     };
   }
@@ -253,6 +272,7 @@ async function resolveEndpoints(sourceConfig, cache, saveCache) {
         endpoints: remoteResult.endpoints,
         fetchedAt: remoteResult.fetchedAt,
         parser: remoteResult.parser || 'unknown',
+        sourceUpdatedAt: remoteResult.sourceUpdatedAt || null,
       });
     }
 
@@ -263,6 +283,7 @@ async function resolveEndpoints(sourceConfig, cache, saveCache) {
         mode: 'remote-live',
         fetchedAt: remoteResult.fetchedAt,
         parser: remoteResult.parser || 'unknown',
+        sourceUpdatedAt: remoteResult.sourceUpdatedAt || null,
       },
     };
   } catch (error) {
@@ -275,6 +296,7 @@ async function resolveEndpoints(sourceConfig, cache, saveCache) {
           mode: 'remote-stale-cache',
           fetchedAt: cache.fetchedAt,
           parser: cache.parser || 'cache',
+          sourceUpdatedAt: cache.sourceUpdatedAt || null,
         },
       };
     }
@@ -290,6 +312,7 @@ async function resolveEndpoints(sourceConfig, cache, saveCache) {
           mode: 'manual-fallback',
           fetchedAt: null,
           parser: 'manual-fallback',
+          sourceUpdatedAt: null,
         },
       };
     }
@@ -307,6 +330,7 @@ async function buildNodesFromRecord(record, env, id) {
         mode: 'legacy-static',
         fetchedAt: record.createdAt || null,
         parser: 'legacy',
+        sourceUpdatedAt: null,
       },
     };
   }
@@ -386,6 +410,7 @@ async function handleGenerate(request, env, url) {
             endpoints: resolved.endpoints,
             fetchedAt: resolved.metadata.fetchedAt,
             parser: resolved.metadata.parser || 'unknown',
+            sourceUpdatedAt: resolved.metadata.sourceUpdatedAt || null,
           }
         : null,
   };
@@ -419,9 +444,11 @@ async function handleGenerate(request, env, url) {
       remoteSourceUrl: sourceConfig.remoteSourceUrl || null,
       refreshHours: sourceConfig.remoteSourceUrl ? sourceConfig.refreshHours : null,
       carrierFilters: sourceConfig.remoteCarrierFilters,
+      remoteMaxAgeHours: sourceConfig.remoteMaxAgeHours,
       maxEndpoints: sourceConfig.maxEndpoints,
       lastFetchedAt: resolved.metadata.fetchedAt,
       parser: resolved.metadata.parser,
+      sourceUpdatedAt: resolved.metadata.sourceUpdatedAt,
     },
     preview: summarizeNodes(expanded.nodes, 20),
     warnings: [...baseNodeResult.warnings, ...resolved.warnings, ...expanded.warnings],
@@ -473,6 +500,9 @@ async function handleSub(request, url, env) {
   }
   if (built.metadata.parser) {
     headers['x-sub-source-parser'] = built.metadata.parser;
+  }
+  if (built.metadata.sourceUpdatedAt) {
+    headers['x-sub-source-updated-at'] = built.metadata.sourceUpdatedAt;
   }
   if (built.warnings.length) {
     headers['x-sub-warning-count'] = String(built.warnings.length);
