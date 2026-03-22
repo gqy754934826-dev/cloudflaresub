@@ -9,6 +9,9 @@ import {
   summarizeNodes,
 } from './core.js';
 
+const SUBSCRIPTION_KEY_PREFIX = 'sub:';
+const KV_LIST_PAGE_SIZE = 100;
+
 function json(data, status = 200) {
   return new Response(JSON.stringify(data, null, 2), {
     status,
@@ -82,7 +85,7 @@ function createShortId(length = 10) {
 async function createUniqueShortId(env, tries = 8) {
   for (let attempt = 0; attempt < tries; attempt += 1) {
     const id = createShortId(10);
-    const exists = await env.SUB_STORE.get(`sub:${id}`);
+    const exists = await env.SUB_STORE.get(buildSubscriptionKey(id));
     if (!exists) {
       return id;
     }
@@ -112,6 +115,10 @@ async function buildDedupHash(body) {
     keepOriginalHost: body.keepOriginalHost !== false,
   };
   return sha256Hex(JSON.stringify(normalized));
+}
+
+function buildSubscriptionKey(id) {
+  return `${SUBSCRIPTION_KEY_PREFIX}${id}`;
 }
 
 function buildSubscriptionUrls(origin, id, accessToken = '') {
@@ -321,6 +328,69 @@ async function resolveEndpoints(sourceConfig, cache, saveCache) {
   }
 }
 
+function buildCacheRecord(metadata, endpoints) {
+  if (!metadata?.fetchedAt || !endpoints?.length) {
+    return null;
+  }
+
+  return {
+    endpoints,
+    fetchedAt: metadata.fetchedAt,
+    parser: metadata.parser || 'unknown',
+    sourceUpdatedAt: metadata.sourceUpdatedAt || null,
+  };
+}
+
+function buildRefreshState(record, status, attemptedAt, message = '', reason = 'unknown') {
+  const cache = record?.cache || null;
+  return {
+    status,
+    reason,
+    message: String(message || ''),
+    lastAttemptAt: attemptedAt,
+    lastSuccessAt:
+      status === 'success'
+        ? attemptedAt
+        : record?.refreshState?.lastSuccessAt || cache?.fetchedAt || null,
+    fetchedAt: cache?.fetchedAt || null,
+    parser: cache?.parser || null,
+    sourceUpdatedAt: cache?.sourceUpdatedAt || null,
+  };
+}
+
+async function persistSubscriptionRecord(env, id, record) {
+  await env.SUB_STORE.put(buildSubscriptionKey(id), JSON.stringify(record));
+}
+
+async function saveRecordCache(env, id, record, nextCache, reason) {
+  const attemptedAt = new Date().toISOString();
+  const nextRecord = {
+    ...record,
+    cache: nextCache,
+    updatedAt: attemptedAt,
+    refreshState: buildRefreshState(
+      { ...record, cache: nextCache },
+      'success',
+      attemptedAt,
+      '',
+      reason,
+    ),
+  };
+  await persistSubscriptionRecord(env, id, nextRecord);
+  return nextRecord;
+}
+
+async function saveRefreshFailure(env, id, record, message, reason) {
+  const attemptedAt = new Date().toISOString();
+  const nextRecord = {
+    ...record,
+    updatedAt: attemptedAt,
+    refreshState: buildRefreshState(record, 'failed', attemptedAt, message, reason),
+  };
+  await persistSubscriptionRecord(env, id, nextRecord);
+  return nextRecord;
+}
+
 async function buildNodesFromRecord(record, env, id) {
   if (Array.isArray(record.nodes) && !record.baseNodes) {
     return {
@@ -341,12 +411,7 @@ async function buildNodesFromRecord(record, env, id) {
   }
 
   const resolved = await resolveEndpoints(record.sourceConfig || {}, record.cache, async (nextCache) => {
-    const updatedRecord = {
-      ...record,
-      cache: nextCache,
-      updatedAt: new Date().toISOString(),
-    };
-    await env.SUB_STORE.put(`sub:${id}`, JSON.stringify(updatedRecord));
+    await saveRecordCache(env, id, record, nextCache, 'sub-request');
   });
 
   const expanded = expandNodes(baseNodes, resolved.endpoints, record.options || {});
@@ -404,15 +469,7 @@ async function handleGenerate(request, env, url) {
     baseNodes: baseNodeResult.nodes,
     options,
     sourceConfig,
-    cache:
-      resolved.metadata.fetchedAt && resolved.endpoints.length
-        ? {
-            endpoints: resolved.endpoints,
-            fetchedAt: resolved.metadata.fetchedAt,
-            parser: resolved.metadata.parser || 'unknown',
-            sourceUpdatedAt: resolved.metadata.sourceUpdatedAt || null,
-          }
-        : null,
+    cache: buildCacheRecord(resolved.metadata, resolved.endpoints),
   };
 
   const dedupHash = await buildDedupHash(body);
@@ -424,7 +481,7 @@ async function handleGenerate(request, env, url) {
     await env.SUB_STORE.put(dedupKey, id);
   }
 
-  await env.SUB_STORE.put(`sub:${id}`, JSON.stringify(payload));
+  await persistSubscriptionRecord(env, id, payload);
 
   const accessToken = env.SUB_ACCESS_TOKEN || '';
   const urls = buildSubscriptionUrls(url.origin, id, accessToken);
@@ -466,7 +523,7 @@ async function handleSub(request, url, env) {
     return text('missing id', 400);
   }
 
-  const raw = await env.SUB_STORE.get(`sub:${id}`);
+  const raw = await env.SUB_STORE.get(buildSubscriptionKey(id));
   if (!raw) {
     return text('not found', 404);
   }
@@ -511,6 +568,119 @@ async function handleSub(request, url, env) {
   return text(rendered.body, 200, rendered.contentType, headers);
 }
 
+export async function runScheduledRefresh(env) {
+  const summary = {
+    scanned: 0,
+    remote: 0,
+    updated: 0,
+    skippedFresh: 0,
+    skippedManual: 0,
+    fallbackCache: 0,
+    fallbackManual: 0,
+    failed: 0,
+    invalid: 0,
+  };
+
+  let cursor;
+  do {
+    const page = await env.SUB_STORE.list({
+      prefix: SUBSCRIPTION_KEY_PREFIX,
+      cursor,
+      limit: KV_LIST_PAGE_SIZE,
+    });
+
+    for (const entry of page.keys) {
+      const id = entry.name.slice(SUBSCRIPTION_KEY_PREFIX.length);
+      summary.scanned += 1;
+
+      try {
+        const raw = await env.SUB_STORE.get(entry.name);
+        if (!raw) {
+          summary.invalid += 1;
+          continue;
+        }
+
+        const record = JSON.parse(raw);
+        const sourceConfig = record?.sourceConfig || {};
+        if (!sourceConfig.remoteSourceUrl) {
+          summary.skippedManual += 1;
+          continue;
+        }
+
+        summary.remote += 1;
+        if (isCacheFresh(record.cache, sourceConfig.refreshHours) && record?.cache?.endpoints?.length) {
+          summary.skippedFresh += 1;
+          continue;
+        }
+
+        let cacheSaved = false;
+        const resolved = await resolveEndpoints(sourceConfig, record.cache, async (nextCache) => {
+          cacheSaved = true;
+          await saveRecordCache(env, id, record, nextCache, 'scheduled');
+        });
+
+        if (cacheSaved && resolved.metadata.mode === 'remote-live') {
+          summary.updated += 1;
+          continue;
+        }
+
+        if (resolved.metadata.mode === 'remote-stale-cache') {
+          summary.fallbackCache += 1;
+          await saveRefreshFailure(
+            env,
+            id,
+            record,
+            resolved.warnings[0] || 'Remote refresh failed and stale cache was used.',
+            'scheduled',
+          );
+          continue;
+        }
+
+        if (resolved.metadata.mode === 'manual-fallback') {
+          summary.fallbackManual += 1;
+          await saveRefreshFailure(
+            env,
+            id,
+            record,
+            resolved.warnings[0] || 'Remote refresh failed and manual fallback was used.',
+            'scheduled',
+          );
+          continue;
+        }
+
+        summary.failed += 1;
+        await saveRefreshFailure(
+          env,
+          id,
+          record,
+          resolved.warnings[0] || `Unexpected refresh mode: ${resolved.metadata.mode}`,
+          'scheduled',
+        );
+      } catch (error) {
+        summary.failed += 1;
+
+        try {
+          const raw = await env.SUB_STORE.get(entry.name);
+          if (raw) {
+            const record = JSON.parse(raw);
+            await saveRefreshFailure(
+              env,
+              id,
+              record,
+              error?.message || 'Unknown scheduled refresh error',
+              'scheduled',
+            );
+          }
+        } catch {}
+      }
+    }
+
+    cursor = page.list_complete ? undefined : page.cursor;
+  } while (cursor);
+
+  return summary;
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -534,5 +704,12 @@ export default {
     }
 
     return env.ASSETS.fetch(request);
+  },
+  async scheduled(controller, env, ctx) {
+    ctx.waitUntil(
+      runScheduledRefresh(env).then((summary) => {
+        console.log('scheduled refresh summary', JSON.stringify(summary));
+      }),
+    );
   },
 };

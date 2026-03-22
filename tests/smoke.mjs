@@ -11,6 +11,7 @@ import {
   renderRawSubscription,
   renderSurgeSubscription,
 } from '../src/core.js';
+import { runScheduledRefresh } from '../src/worker.js';
 
 const CARRIER_TELECOM = '\u7535\u4fe1';
 const CARRIER_UNICOM = '\u8054\u901a';
@@ -128,5 +129,118 @@ const secret = 'this-is-a-very-secret-key';
 const token = await encryptPayload({ nodes: expanded.nodes }, secret);
 const payload = await decryptPayload(token, secret);
 assert.equal(payload.nodes.length, 2);
+
+class MemoryKvNamespace {
+  constructor(initialEntries = {}) {
+    this.store = new Map(Object.entries(initialEntries));
+  }
+
+  async get(key) {
+    return this.store.has(key) ? this.store.get(key) : null;
+  }
+
+  async put(key, value) {
+    this.store.set(key, value);
+  }
+
+  async list(options = {}) {
+    const prefix = options.prefix || '';
+    const limit = options.limit || 1000;
+    const cursor = Number.parseInt(String(options.cursor || '0'), 10) || 0;
+    const keys = [...this.store.keys()]
+      .filter((key) => key.startsWith(prefix))
+      .sort();
+    const page = keys.slice(cursor, cursor + limit);
+    const nextCursor = cursor + page.length;
+
+    return {
+      keys: page.map((name) => ({ name })),
+      list_complete: nextCursor >= keys.length,
+      cursor: nextCursor >= keys.length ? undefined : String(nextCursor),
+    };
+  }
+}
+
+const nowIso = new Date().toISOString();
+const staleIso = new Date(Date.now() - 5 * 60 * 60 * 1000).toISOString();
+const kv = new MemoryKvNamespace({
+  'sub:remote-demo': JSON.stringify({
+    version: 2,
+    createdAt: staleIso,
+    updatedAt: staleIso,
+    baseNodes: nodes,
+    options: { keepOriginalHost: true, namePrefix: 'CF' },
+    sourceConfig: {
+      manualPreferredIps: '',
+      remoteSourceUrl: 'https://remote.example.com/ip-list.json',
+      refreshHours: 1,
+      remoteDefaultPort: 443,
+      remoteCarrierFilters: [CARRIER_TELECOM, CARRIER_MOBILE],
+      remoteMaxAgeHours: 6,
+      maxEndpoints: 2,
+    },
+    cache: {
+      endpoints: [{ host: '104.16.1.2', port: 443, label: 'old' }],
+      fetchedAt: staleIso,
+      parser: 'json',
+      sourceUpdatedAt: staleIso,
+    },
+  }),
+  'sub:manual-demo': JSON.stringify({
+    version: 2,
+    createdAt: nowIso,
+    updatedAt: nowIso,
+    baseNodes: nodes,
+    options: { keepOriginalHost: true, namePrefix: 'CF' },
+    sourceConfig: {
+      manualPreferredIps: '104.16.8.8#Manual',
+      remoteSourceUrl: '',
+      refreshHours: 3,
+      remoteDefaultPort: 443,
+      remoteCarrierFilters: [],
+      remoteMaxAgeHours: 6,
+      maxEndpoints: 1,
+    },
+    cache: null,
+  }),
+});
+
+const env = { SUB_STORE: kv };
+const originalFetch = globalThis.fetch;
+globalThis.fetch = async (url) => {
+  assert.match(String(url), /remote\.example\.com/);
+  return new Response(
+    JSON.stringify({
+      updated_at: nowIso,
+      data: [
+        { ip: '104.16.99.1', carrier: CARRIER_TELECOM },
+        { ip: '104.18.99.2', carrier: CARRIER_MOBILE },
+      ],
+    }),
+    {
+      status: 200,
+      headers: {
+        'content-type': 'application/json; charset=utf-8',
+      },
+    },
+  );
+};
+
+try {
+  const summary = await runScheduledRefresh(env);
+  assert.equal(summary.scanned, 2);
+  assert.equal(summary.remote, 1);
+  assert.equal(summary.updated, 1);
+  assert.equal(summary.skippedManual, 1);
+  assert.equal(summary.failed, 0);
+
+  const refreshedRecord = JSON.parse(await kv.get('sub:remote-demo'));
+  assert.equal(refreshedRecord.cache.endpoints.length, 2);
+  assert.equal(refreshedRecord.cache.endpoints[0].host, '104.16.99.1');
+  assert.equal(refreshedRecord.refreshState.status, 'success');
+  assert.equal(refreshedRecord.refreshState.reason, 'scheduled');
+} finally {
+  globalThis.fetch = originalFetch;
+}
 
 console.log('smoke test passed');
