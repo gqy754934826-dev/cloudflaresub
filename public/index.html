@@ -62,9 +62,51 @@ cf.example.com:443#US-Edge"
             </p>
           </div>
 
+          <div>
+            <label for="remoteSourceUrl">3. 远程优选 IP 源 URL（可选，推荐）</label>
+            <input
+              id="remoteSourceUrl"
+              name="remoteSourceUrl"
+              type="url"
+              placeholder="例如 https://api.uouin.com/cloudflare.html"
+            />
+            <p class="hint">
+              填写后，订阅内容会按设定间隔自动从远程页面刷新优选 IP；上面的手动优选 IP 会作为远程拉取失败时的备用回退。
+            </p>
+          </div>
+
           <div class="grid two-col compact">
             <div>
-              <label for="namePrefix">3. 备注前缀（可选）</label>
+              <label for="refreshHours">4. 刷新间隔（小时）</label>
+              <input id="refreshHours" name="refreshHours" type="number" min="1" max="24" value="3" />
+            </div>
+            <div>
+              <label for="maxEndpoints">5. 每次保留前几个优选 IP</label>
+              <input id="maxEndpoints" name="maxEndpoints" type="number" min="1" max="200" value="12" />
+            </div>
+          </div>
+
+          <div>
+            <label for="remoteMaxAgeHours">6. 远程源最大允许陈旧（小时）</label>
+            <input id="remoteMaxAgeHours" name="remoteMaxAgeHours" type="number" min="1" max="168" value="6" />
+            <p class="hint">如果远程页面里带有更新时间，且早于这个阈值，系统会拒绝使用旧数据并回退到缓存或手动备用 IP。</p>
+          </div>
+
+          <div>
+            <label for="remoteCarrierFilters">7. 线路筛选</label>
+            <input
+              id="remoteCarrierFilters"
+              name="remoteCarrierFilters"
+              type="text"
+              value="电信,联通,移动"
+              placeholder="电信,联通,移动"
+            />
+            <p class="hint">节点名会自动带上线路标识，例如 <code>CF | 电信-01</code>，更适合 v2rayN 直接订阅刷新。</p>
+          </div>
+
+          <div class="grid two-col compact">
+            <div>
+              <label for="namePrefix">8. 节点名前缀（可选）</label>
               <input id="namePrefix" name="namePrefix" type="text" placeholder="例如 CF" />
             </div>
             <div class="checkbox-wrap">
