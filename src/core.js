@@ -2,6 +2,32 @@ const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
 
 const DEFAULT_TEST_URL = 'http://cp.cloudflare.com/generate_204';
+const CARRIER_NAMES = {
+  telecom: '\u7535\u4fe1',
+  unicom: '\u8054\u901a',
+  mobile: '\u79fb\u52a8',
+  multi: '\u591a\u7ebf',
+  ipv6: 'IPV6',
+};
+const HOST_FIELD_KEYS = ['ip', 'host', 'address', 'addr', 'server', 'endpoint', 'domain'];
+const PORT_FIELD_KEYS = ['port', 'server_port', 'serverPort'];
+const CARRIER_FIELD_KEYS = ['carrier', 'isp', 'line', 'operator', 'type', 'network'];
+const LABEL_FIELD_KEYS = ['label', 'remark', 'name', 'title', 'location', 'region', 'city'];
+const JSON_START_PATTERN = /^\s*[\[{]/;
+const HTML_TAG_PATTERN = /<[^>]+>/;
+const HOST_CAPTURE_PATTERN =
+  /(\[[^\]]+\]|(?:\d{1,3}\.){3}\d{1,3}|(?:[A-Fa-f0-9]{0,4}:){2,}[A-Fa-f0-9]{0,4}|(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,})/;
+const HOST_GLOBAL_PATTERN = new RegExp(HOST_CAPTURE_PATTERN.source, 'g');
+const TEXT_IP_LABEL_PATTERNS = [
+  new RegExp(
+    `^(?<label>[^\\n]*?)\\s*(?<host>${HOST_CAPTURE_PATTERN.source})(?::(?<port>\\d{1,5}))?(?:\\s*(?:#|\\||,|\\t|\\s+)\\s*(?<tail>.+))?$`,
+    'i',
+  ),
+  new RegExp(
+    `^(?<host>${HOST_CAPTURE_PATTERN.source})(?::(?<port>\\d{1,5}))?(?:\\s*(?:#|\\||,|\\t|\\s+)\\s*(?<label>.+))$`,
+    'i',
+  ),
+];
 
 export const SUPPORTED_PROTOCOLS = ['vmess', 'vless', 'trojan'];
 
@@ -144,6 +170,8 @@ export function parsePreferredEndpoints(inputText) {
 }
 
 export function extractPreferredEndpointsFromContent(inputText, options = {}) {
+  return extractPreferredEndpointsByParser(inputText, options);
+
   const text = normalizeRemoteSourceText(inputText);
   const defaultPort = normalizePort(options.defaultPort, 443);
   const maxEndpoints = clampInteger(options.maxEndpoints, 1, 200, 12);
@@ -634,6 +662,348 @@ function splitHostAndPort(input) {
   return { host: value, port: undefined };
 }
 
+function extractPreferredEndpointsByParser(inputText, options = {}) {
+  const context = {
+    defaultPort: normalizePort(options.defaultPort, 443),
+    maxEndpoints: clampInteger(options.maxEndpoints, 1, 200, 12),
+    carrierFilters: normalizeCarrierFilters(options.carrierFilters),
+    contentType: String(options.contentType || '').toLowerCase(),
+  };
+  const parserChain = [
+    ['json', extractEndpointsFromJsonContent],
+    ['text', extractEndpointsFromPlainText],
+    ['html', extractEndpointsFromHtmlContent],
+  ];
+  const warnings = [];
+
+  for (const [parser, extractor] of parserChain) {
+    const result = extractor(inputText, context);
+    if (result.endpoints.length) {
+      return {
+        endpoints: result.endpoints,
+        warnings: [...warnings, ...result.warnings],
+        parser,
+      };
+    }
+    warnings.push(...result.warnings);
+  }
+
+  return {
+    endpoints: [],
+    warnings: warnings.length
+      ? warnings
+      : ['Remote preferred IP source did not yield any usable endpoints.'],
+    parser: 'none',
+  };
+}
+
+function extractEndpointsFromJsonContent(inputText, context) {
+  const text = normalizeText(inputText);
+  if (!text || (!JSON_START_PATTERN.test(text) && !context.contentType.includes('json'))) {
+    return { endpoints: [], warnings: [] };
+  }
+
+  try {
+    const data = JSON.parse(text);
+    const candidates = [];
+    collectJsonEndpointCandidates(data, candidates);
+    return buildPreferredEndpointsFromCandidates(candidates, context, 'JSON');
+  } catch (error) {
+    return {
+      endpoints: [],
+      warnings: context.contentType.includes('json') ? [`JSON parser failed: ${error.message}`] : [],
+    };
+  }
+}
+
+function extractEndpointsFromPlainText(inputText, context) {
+  const text = decodeHtmlEntities(String(inputText || '')).replace(/\r\n?/g, '\n');
+  if (!text.trim() || looksLikeHtml(text)) {
+    return { endpoints: [], warnings: [] };
+  }
+
+  const candidates = [];
+  const lines = text
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  for (const line of lines) {
+    const candidate = parseEndpointCandidateFromLine(line, context.defaultPort);
+    if (candidate) {
+      candidates.push(candidate);
+    }
+  }
+
+  return buildPreferredEndpointsFromCandidates(candidates, context, 'plain text');
+}
+
+function extractEndpointsFromHtmlContent(inputText, context) {
+  const text = normalizeRemoteSourceText(inputText);
+  if (!text.trim()) {
+    return { endpoints: [], warnings: [] };
+  }
+
+  const candidates = [];
+  const carrierPattern = getCarrierMatcher();
+  const lines = text.split('\n').map((item) => item.trim()).filter(Boolean);
+  for (const line of lines) {
+    const carrierMatch = line.match(carrierPattern);
+    if (!carrierMatch) {
+      continue;
+    }
+    const hosts = [...line.matchAll(HOST_GLOBAL_PATTERN)];
+    if (!hosts.length) {
+      continue;
+    }
+
+    const carrier = normalizeCarrierName(carrierMatch[0]);
+    for (const hostMatch of hosts) {
+      const host = sanitizeHost(hostMatch[0]);
+      const portMatch = line
+        .slice(hostMatch.index + hostMatch[0].length)
+        .match(/^\s*:\s*(\d{1,5})/);
+      candidates.push({
+        host,
+        port: portMatch ? normalizePort(portMatch[1], context.defaultPort) : context.defaultPort,
+        carrier,
+        label: carrier,
+      });
+    }
+  }
+
+  if (!candidates.length) {
+    for (let index = 0; index < lines.length; index += 1) {
+      const carrierMatch = lines[index].match(carrierPattern);
+      if (!carrierMatch) {
+        continue;
+      }
+      for (let offset = 1; offset <= 3 && index + offset < lines.length; offset += 1) {
+        const hostMatch = lines[index + offset].match(HOST_CAPTURE_PATTERN);
+        if (!hostMatch) {
+          continue;
+        }
+        const host = sanitizeHost(hostMatch[0]);
+        const portMatch = lines[index + offset]
+          .slice(lines[index + offset].indexOf(hostMatch[0]) + hostMatch[0].length)
+          .match(/^\s*:\s*(\d{1,5})/);
+        candidates.push({
+          host,
+          port: portMatch ? normalizePort(portMatch[1], context.defaultPort) : context.defaultPort,
+          carrier: normalizeCarrierName(carrierMatch[0]),
+          label: normalizeCarrierName(carrierMatch[0]),
+        });
+        break;
+      }
+    }
+  }
+
+  return buildPreferredEndpointsFromCandidates(candidates, context, 'HTML');
+}
+
+function collectJsonEndpointCandidates(value, candidates) {
+  if (Array.isArray(value)) {
+    value.forEach((item) => collectJsonEndpointCandidates(item, candidates));
+    return;
+  }
+
+  if (!value || typeof value !== 'object') {
+    return;
+  }
+
+  const candidate = objectToEndpointCandidate(value);
+  if (candidate) {
+    candidates.push(candidate);
+  }
+
+  for (const child of Object.values(value)) {
+    collectJsonEndpointCandidates(child, candidates);
+  }
+}
+
+function objectToEndpointCandidate(value) {
+  const hostValue = pickObjectField(value, HOST_FIELD_KEYS);
+  if (typeof hostValue !== 'string' && typeof hostValue !== 'number') {
+    return null;
+  }
+
+  const portValue = pickObjectField(value, PORT_FIELD_KEYS);
+  const carrierValue = pickObjectField(value, CARRIER_FIELD_KEYS);
+  const labelValue = pickObjectField(value, LABEL_FIELD_KEYS);
+  const host = sanitizeHost(String(hostValue));
+  if (!host) {
+    return null;
+  }
+
+  return {
+    host,
+    port: portValue === undefined ? undefined : normalizePort(portValue, undefined),
+    carrier: normalizeCarrierName(carrierValue),
+    label: String(labelValue || '').trim(),
+  };
+}
+
+function pickObjectField(value, keys) {
+  for (const key of keys) {
+    if (value[key] !== undefined && value[key] !== null && value[key] !== '') {
+      return value[key];
+    }
+  }
+  return undefined;
+}
+
+function parseEndpointCandidateFromLine(line, defaultPort) {
+  const normalized = decodeHtmlEntities(String(line || '').trim());
+  if (!normalized) {
+    return null;
+  }
+
+  for (const pattern of TEXT_IP_LABEL_PATTERNS) {
+    const match = normalized.match(pattern);
+    if (!match?.groups?.host) {
+      continue;
+    }
+
+    const host = sanitizeHost(match.groups.host);
+    const port = match.groups.port ? normalizePort(match.groups.port, defaultPort) : defaultPort;
+    const labelParts = [match.groups.label, match.groups.tail]
+      .map((item) => String(item || '').trim())
+      .filter(Boolean);
+    const label = labelParts.join(' | ');
+    const carrier = normalizeCarrierName(label);
+    return {
+      host,
+      port,
+      carrier,
+      label,
+    };
+  }
+
+  return null;
+}
+
+function buildPreferredEndpointsFromCandidates(candidates, context, parserName) {
+  const filterList = context.carrierFilters;
+  const allowedCarriers = new Set(filterList);
+  const counters = new Map();
+  const buckets = new Map();
+  const standalone = [];
+  const seen = new Set();
+
+  for (const candidate of candidates) {
+    const host = sanitizeHost(candidate.host);
+    if (!host) {
+      continue;
+    }
+
+    const port = candidate.port || context.defaultPort;
+    const carrier = normalizeCarrierName(candidate.carrier);
+    if (allowedCarriers.size && carrier && !allowedCarriers.has(carrier)) {
+      continue;
+    }
+    if (allowedCarriers.size && !carrier) {
+      continue;
+    }
+
+    const dedupeKey = `${host}:${port}`;
+    if (seen.has(dedupeKey)) {
+      continue;
+    }
+    seen.add(dedupeKey);
+
+    const rawLabel = normalizeEndpointLabel(candidate.label);
+    if (carrier) {
+      const count = (counters.get(carrier) || 0) + 1;
+      counters.set(carrier, count);
+      const endpoint = {
+        host,
+        port,
+        label: buildCarrierLabel(carrier, rawLabel, count),
+      };
+      const bucket = buckets.get(carrier) || [];
+      bucket.push(endpoint);
+      buckets.set(carrier, bucket);
+      continue;
+    }
+
+    standalone.push({
+      host,
+      port,
+      label: rawLabel || `${host}:${port}`,
+    });
+  }
+
+  const endpoints = [];
+  const carrierOrder = filterList.length ? filterList : [...buckets.keys()];
+  let cursor = 0;
+
+  while (endpoints.length < context.maxEndpoints && carrierOrder.length) {
+    const carrier = carrierOrder[cursor % carrierOrder.length];
+    const bucket = buckets.get(carrier) || [];
+    if (bucket.length) {
+      endpoints.push(bucket.shift());
+    }
+    cursor += 1;
+    if (carrierOrder.every((item) => !(buckets.get(item) || []).length)) {
+      break;
+    }
+  }
+
+  for (const endpoint of standalone) {
+    if (endpoints.length >= context.maxEndpoints) {
+      break;
+    }
+    endpoints.push(endpoint);
+  }
+
+  return {
+    endpoints,
+    warnings: endpoints.length ? [] : [`${parserName} parser did not find any usable endpoints.`],
+  };
+}
+
+function buildCarrierLabel(carrier, rawLabel, count) {
+  if (!rawLabel || normalizeEndpointLabel(rawLabel) === carrier) {
+    return `${carrier}-${String(count).padStart(2, '0')}`;
+  }
+  if (rawLabel && !labelContainsCarrier(rawLabel, carrier)) {
+    return `${carrier}-${rawLabel}`;
+  }
+  return rawLabel;
+}
+
+function labelContainsCarrier(label, carrier) {
+  const normalizedLabel = normalizeCarrierName(label);
+  return normalizedLabel === carrier || String(label || '').includes(carrier);
+}
+
+function normalizeEndpointLabel(value) {
+  return String(value || '')
+    .replace(/\s+/g, ' ')
+    .replace(/^[#|,\s]+|[#|,\s]+$/g, '')
+    .trim();
+}
+
+function sanitizeHost(value) {
+  return String(value || '')
+    .trim()
+    .replace(/^\[|\]$/g, '')
+    .replace(/[,\u3002\uFF0C\uFF1B\u3001]+$/g, '');
+
+  return String(value || '')
+    .trim()
+    .replace(/^\[|\]$/g, '')
+    .replace(/[，。；、]+$/g, '');
+}
+
+function looksLikeHtml(text) {
+  return HTML_TAG_PATTERN.test(String(text || ''));
+}
+
+function getCarrierMatcher() {
+  return /(?:\u7535\u4fe1|\u8054\u901a|\u79fb\u52a8|\u591a\u7ebf|IPV6|IPv6|ipv6|telecom|unicom|mobile|cmcc|ct|cu)/i;
+}
+
 function normalizeRemoteSourceText(inputText) {
   return decodeHtmlEntities(
     String(inputText || '')
@@ -652,6 +1022,21 @@ function normalizeCarrierFilters(input) {
 
 function normalizeCarrierName(value) {
   const text = String(value || '').trim().toLowerCase();
+  if (text === 'ct' || text === 'telecom' || text === CARRIER_NAMES.telecom.toLowerCase()) {
+    return CARRIER_NAMES.telecom;
+  }
+  if (text === 'cu' || text === 'unicom' || text === CARRIER_NAMES.unicom.toLowerCase()) {
+    return CARRIER_NAMES.unicom;
+  }
+  if (text === 'cmcc' || text === 'mobile' || text === CARRIER_NAMES.mobile.toLowerCase()) {
+    return CARRIER_NAMES.mobile;
+  }
+  if (text === 'multi' || text === CARRIER_NAMES.multi.toLowerCase()) {
+    return CARRIER_NAMES.multi;
+  }
+  if (text === 'ipv6' || text === 'ip6') {
+    return CARRIER_NAMES.ipv6;
+  }
   if (!text) {
     return '';
   }

@@ -175,11 +175,13 @@ async function fetchRemoteEndpoints(sourceConfig) {
     throw new Error(`远程源返回 ${response.status}`);
   }
 
+  const contentType = response.headers.get('content-type') || '';
   const content = await response.text();
-  const { endpoints, warnings } = extractPreferredEndpointsFromContent(content, {
+  const { endpoints, warnings, parser } = extractPreferredEndpointsFromContent(content, {
     defaultPort: sourceConfig.remoteDefaultPort,
     carrierFilters: sourceConfig.remoteCarrierFilters,
     maxEndpoints: sourceConfig.maxEndpoints,
+    contentType,
   });
 
   if (!endpoints.length) {
@@ -189,6 +191,7 @@ async function fetchRemoteEndpoints(sourceConfig) {
   return {
     endpoints,
     warnings,
+    parser,
     fetchedAt: new Date().toISOString(),
   };
 }
@@ -217,6 +220,7 @@ async function resolveEndpoints(sourceConfig, cache, saveCache) {
       metadata: {
         mode: 'manual',
         fetchedAt: null,
+        parser: 'manual',
       },
     };
   }
@@ -228,6 +232,7 @@ async function resolveEndpoints(sourceConfig, cache, saveCache) {
       metadata: {
         mode: 'remote-cache',
         fetchedAt: cache.fetchedAt,
+        parser: cache.parser || 'cache',
       },
     };
   }
@@ -238,6 +243,7 @@ async function resolveEndpoints(sourceConfig, cache, saveCache) {
       await saveCache({
         endpoints: remoteResult.endpoints,
         fetchedAt: remoteResult.fetchedAt,
+        parser: remoteResult.parser || 'unknown',
       });
     }
 
@@ -247,6 +253,7 @@ async function resolveEndpoints(sourceConfig, cache, saveCache) {
       metadata: {
         mode: 'remote-live',
         fetchedAt: remoteResult.fetchedAt,
+        parser: remoteResult.parser || 'unknown',
       },
     };
   } catch (error) {
@@ -258,6 +265,7 @@ async function resolveEndpoints(sourceConfig, cache, saveCache) {
         metadata: {
           mode: 'remote-stale-cache',
           fetchedAt: cache.fetchedAt,
+          parser: cache.parser || 'cache',
         },
       };
     }
@@ -272,6 +280,7 @@ async function resolveEndpoints(sourceConfig, cache, saveCache) {
         metadata: {
           mode: 'manual-fallback',
           fetchedAt: null,
+          parser: 'manual-fallback',
         },
       };
     }
@@ -288,6 +297,7 @@ async function buildNodesFromRecord(record, env, id) {
       metadata: {
         mode: 'legacy-static',
         fetchedAt: record.createdAt || null,
+        parser: 'legacy',
       },
     };
   }
@@ -366,6 +376,7 @@ async function handleGenerate(request, env, url) {
         ? {
             endpoints: resolved.endpoints,
             fetchedAt: resolved.metadata.fetchedAt,
+            parser: resolved.metadata.parser || 'unknown',
           }
         : null,
   };
@@ -401,6 +412,7 @@ async function handleGenerate(request, env, url) {
       carrierFilters: sourceConfig.remoteCarrierFilters,
       maxEndpoints: sourceConfig.maxEndpoints,
       lastFetchedAt: resolved.metadata.fetchedAt,
+      parser: resolved.metadata.parser,
     },
     preview: summarizeNodes(expanded.nodes, 20),
     warnings: [...baseNodeResult.warnings, ...resolved.warnings, ...expanded.warnings],
@@ -449,6 +461,9 @@ async function handleSub(request, url, env) {
   const headers = {};
   if (built.metadata.fetchedAt) {
     headers['x-sub-last-fetched-at'] = built.metadata.fetchedAt;
+  }
+  if (built.metadata.parser) {
+    headers['x-sub-source-parser'] = built.metadata.parser;
   }
   if (built.warnings.length) {
     headers['x-sub-warning-count'] = String(built.warnings.length);
